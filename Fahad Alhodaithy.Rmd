@@ -1,0 +1,438 @@
+---
+title: "Financial Econometrics - Final project"
+author: "Fahad Alhodaithy"
+date: "2022-11-05"
+output: html_document
+---
+
+##Loading Libraries
+
+```{r, warning=FALSE, message=FALSE}
+
+library(quantmod)
+library(ggplot2)
+library(fitdistrplus)
+library(moments)
+library(Rcpp)
+library(knitr)
+library(kableExtra)
+library(rugarch)
+library(QRM)
+library(fGarch)
+library(LambertW)
+library(copula)
+library(sn)
+library(ks)
+library(base.rms)
+library(TSstudio)
+library(tidyverse)
+library(forecast)
+library(htmlTable)
+library(tseries)
+
+```
+
+# Reading & Cleaning the data
+
+```{r, warning=FALSE, message=FALSE}
+
+# Past ten years' stock prices for SPXL and Goldman Sachs from Yahoo Finance
+
+spxl <- getSymbols("SPXL", src = "yahoo", from = "2012-07-01", to = "2022-07-01", auto.assign = FALSE)
+gs <- getSymbols("GS", src = "yahoo", from = "2012-07-01", to = "2022-07-01", auto.assign = FALSE)
+
+# Calculating Log returns
+
+spxl_log_ret <- (diff(log(spxl[,6])))[-1,]
+gs_log_ret <- (diff(log(gs[,6])))[-1,]
+
+```
+
+# Exploring the data to determine necessity for modeling time dependence and volatility of log returns.
+
+```{r, warning=FALSE, message=FALSE}
+
+summary(spxl_log_ret) %>%
+  kbl() %>%
+  kable_styling()
+
+summary(gs_log_ret) %>%
+  kbl() %>%
+  kable_styling()
+
+# Time Series Plots
+
+ts_plot(spxl_log_ret,
+        title = "Time Series SPXL (2012/07 - 2022/06)",
+        Xtitle = "Time",
+        Ytitle = "Log Returns",
+        color = "#bd2828",
+        slider = TRUE)
+
+ts_plot(gs_log_ret,
+        title = "Time Series SPXL (2012/07 - 2022/06)",
+        Xtitle = "Time",
+        Ytitle = "Log Returns",
+        color =  "#2837bd",
+        slider = TRUE)
+
+# ACF & PACF Plots
+
+par(mfrow=c(2,2))
+acf(spxl_log_ret, main = "ACF: SPXL Log Returns")
+pacf(spxl_log_ret, main = "PACF: SPXL Log Returns")
+acf(gs_log_ret, main = "ACF: GS Log Returns")
+pacf(gs_log_ret, main = "PACF: GS Log Returns")
+
+#Check for Skewness and Kurtosis
+
+sk1 <- skewness(spxl_log_ret)
+print(paste("SPXL Log Returns skewness = ", sk1))
+
+sk2 <- skewness(gs_log_ret)
+print(paste("Goldman Sachs Log Returns skewness = ", sk2))
+
+k1 <- kurtosis(spxl_log_ret)
+print(paste("SPXL Log Returns kurtosis = ", k1))
+
+k2 <- kurtosis(gs_log_ret)
+print(paste("Goldman Sachs Log Returns kurtosis = ", k2))
+      
+#Test for serial correlation
+
+Box.test(x=spxl_log_ret,lag=5,type="Ljung-Box")
+Box.test(x=gs_log_ret,lag=5,type="Ljung-Box")
+
+adf.test(spxl_log_ret)
+adf.test(gs_log_ret)
+
+```
+
+# Building Time Series Models
+
+```{r, warning=FALSE, message=FALSE}
+
+# Fit AR(1)-GARCH(1,1) model
+
+SPXLfit=garchFit(formula=~arma(1,0)+garch(1,1),data=spxl_log_ret,cond.dist="norm")
+GSfit=garchFit(formula=~arma(1,0)+garch(1,1),data=gs_log_ret,cond.dist="norm")
+
+summary(SPXLfit)
+summary(GSfit)
+
+# Residuals from AR-GARCH model
+
+SPXL_res=residuals(SPXLfit)
+GS_res=residuals(GSfit)
+
+# Standardized Residuals from AR-GARCH model
+
+SPXL_res_sd=residuals(SPXLfit,standardize=TRUE)
+GS_res_sd=residuals(GSfit,standardize=TRUE)
+
+#Fit t-distribution
+
+#Fit t-distribution to residuals
+
+std.SPXL_res = as.numeric(fitdistr(SPXL_res,"t")$estimate)
+std.GS_res = as.numeric(fitdistr(GS_res,"t")$estimate)
+
+std.SPXL_res[2] = std.SPXL_res[2] * sqrt(std.SPXL_res[3] / (std.SPXL_res[3]-2)) 
+std.GS_res[2] = std.GS_res[2] * sqrt(std.GS_res[3] / (std.GS_res[3]-2))
+
+#Fit t-distribution to standardized residuals
+
+std.SPXL_res_sd = as.numeric(fitdistr(SPXL_res_sd,"t")$estimate)
+std.GS_res_sd = as.numeric(fitdistr(GS_res_sd,"t")$estimate)
+
+std.SPXL_res_sd[2] = std.SPXL_res_sd[2] * sqrt(std.SPXL_res_sd[3] / (std.SPXL_res_sd[3]-2)) 
+std.GS_res_sd[2] = std.GS_res_sd[2] * sqrt(std.GS_res_sd[3] / (std.GS_res_sd[3]-2))
+
+```
+
+# Fitting Copulas to Residuals:
+
+```{r, warning=FALSE, message=FALSE}
+
+# Estimate of the correlation coefficient in the t-copula using Kendall's tau
+
+cor_tau = cor(SPXL_res, GS_res, method = "kendall", use="pairwise.complete.obs")
+round(cor_tau,2)
+omega = sin((pi/2)*cor_tau) #estimator for rho
+round(omega,2)
+
+# Combining datasets:
+
+data1 = cbind(pstd(SPXL_res, std.SPXL_res[1], std.SPXL_res[2], std.SPXL_res[3]),
+              pstd(GS_res, std.GS_res[1], std.GS_res[2], std.GS_res[3]))
+
+# Fit t-copula
+cop_t_dim2 = tCopula(omega, dim = 2, dispstr = "un", df = 4) #define t copula
+Ct=fitCopula(cop_t_dim2, data1, method="ml", start=c(omega,4) ) 
+Ct@estimate
+lst_value <- loglikCopula(param=Ct@estimate,u=data1,copula=tCopula(dim=2));#compute loglikelihood function
+AIC_Ct <- (-2) * lst_value + 2*length(Ct@estimate) #compute AIC
+
+# Fit Gaussian copula
+Cgauss=fitCopula(copula=normalCopula(dim=2),data=data1, method="ml")
+Cgauss@estimate
+lst_value <- loglikCopula(param=Cgauss@estimate,u=data1,copula=normalCopula(dim=2))
+AIC_gauss <- (-2)*lst_value+2*length(Cgauss@estimate)#compute AIC
+
+# Fit Gumbel copula
+Cgu=fitCopula(copula=gumbelCopula(3,dim=2),data=data1,method="ml")
+Cgu@estimate
+lst_value <- loglikCopula(param=Cgu@estimate,u=data1,copula=gumbelCopula(dim=2))
+AIC_Cgu <- (-2)*lst_value+2*length(Cgu@estimate)
+
+# Fit Clayton copula
+Ccl=fitCopula(copula=claytonCopula(1,dim=2),data=data1,method="ml") 
+Ccl@estimate
+lst_value <- loglikCopula(param=Ccl@estimate,u=data1,copula=claytonCopula(dim=2))
+AIC_Ccl <- (-2)*lst_value+2*length(Ccl@estimate)
+
+AIC_Values <- rbind(AIC_Ccl,AIC_Cgu, AIC_gauss, AIC_Ct)
+colnames(AIC_Values) <- c("AIC")
+AIC_Values <- AIC_Values %>%
+  data.frame()
+AIC_Values
+
+```
+
+# Fitting Copulas to Standerdized Residuals:
+
+```{r, warning=FALSE, message=FALSE}
+
+# Estimate of the correlation coefficient in the t-copula using Kendall's tau
+
+cor_tau = cor(SPXL_res_sd, GS_res_sd, method = "kendall", use="pairwise.complete.obs")
+round(cor_tau,2)
+omega = sin((pi/2)*cor_tau) #estimator for rho
+round(omega,2)
+
+# Combining datasets:
+
+data1 = cbind(pstd(SPXL_res_sd, std.SPXL_res_sd[1], std.SPXL_res_sd[2], std.SPXL_res_sd[3]),
+              pstd(GS_res_sd, std.GS_res_sd[1], std.GS_res_sd[2], std.GS_res_sd[3]))
+
+# Fit t-copula
+cop_t_dim2 = tCopula(omega, dim = 2, dispstr = "un", df = 4) #define t copula
+Ct=fitCopula(cop_t_dim2, data1, method="ml", start=c(omega,4) ) 
+Ct@estimate
+lst_value <- loglikCopula(param=Ct@estimate,u=data1,copula=tCopula(dim=2));#compute loglikelihood function
+AIC_Ct <- (-2) * lst_value + 2*length(Ct@estimate) #compute AIC
+
+# Fit Gaussian copula
+Cgauss=fitCopula(copula=normalCopula(dim=2),data=data1, method="ml")
+Cgauss@estimate
+lst_value <- loglikCopula(param=Cgauss@estimate,u=data1,copula=normalCopula(dim=2))
+AIC_gauss <- (-2)*lst_value+2*length(Cgauss@estimate)#compute AIC
+
+# Fit Gumbel copula
+Cgu=fitCopula(copula=gumbelCopula(3,dim=2),data=data1,method="ml")
+Cgu@estimate
+lst_value <- loglikCopula(param=Cgu@estimate,u=data1,copula=gumbelCopula(dim=2))
+AIC_Cgu <- (-2)*lst_value+2*length(Cgu@estimate)
+
+# Fit Clayton copula
+Ccl=fitCopula(copula=claytonCopula(1,dim=2),data=data1,method="ml") 
+Ccl@estimate
+lst_value <- loglikCopula(param=Ccl@estimate,u=data1,copula=claytonCopula(dim=2))
+AIC_Ccl <- (-2)*lst_value+2*length(Ccl@estimate)
+
+AIC_Values_sd <- rbind(AIC_Ccl,AIC_Cgu, AIC_gauss, AIC_Ct)
+colnames(AIC_Values_sd) <- c("AIC")
+AIC_Values_sd <- AIC_Values_sd %>%
+  data.frame()
+AIC_Values_sd
+
+```
+
+# Residual Analysis
+
+```{r, warning=FALSE, message=FALSE}
+
+## SPXL
+
+# ACF Plots
+
+par(mfrow=c(2,2))
+acf(SPXL_res, main = "ACF: SPXL Residuals")
+acf(SPXL_res^2, main = "ACF: SPXL Squared Residuals")
+
+acf(SPXL_res_sd, main = "ACF: SPXL Standerdized Residuals")
+acf(SPXL_res_sd^2, main = "ACF: SPXL Standerdized Squared Residuals")
+
+#Test for serial correlation
+
+Box.test(x=SPXL_res,lag=5,type="Ljung-Box")
+Box.test(x=SPXL_res_sd,lag=5,type="Ljung-Box")
+adf.test(SPXL_res)
+adf.test(SPXL_res_sd)
+
+# Check Normal Distribution
+
+qqnorm(SPXL_res)
+qqline(SPXL_res)
+hist(SPXL_res)
+
+qqnorm(SPXL_res_sd)
+qqline(SPXL_res_sd)
+hist(SPXL_res_sd)
+
+## GS
+
+# ACF Plots
+
+acf(GS_res, main = "ACF: Goldman Sachs Residuals")
+acf(GS_res^2, main = "ACF: Goldman Sachs Squared Residuals")
+acf(GS_res_sd, main = "ACF: Goldman Sachs Standardized Residuals")
+acf(GS_res_sd^2, main = "ACF: Goldman Sachs Standardized Squared Residuals")
+
+# Check Normal Distribution
+
+qqnorm(GS_res)
+qqline(GS_res)
+hist(GS_res)
+
+qqnorm(GS_res_sd)
+qqline(GS_res_sd)
+hist(GS_res_sd)
+
+#Test for serial correlation
+
+Box.test(x=GS_res,lag=5,type="Ljung-Box")
+Box.test(x=GS_res_sd,lag=5,type="Ljung-Box")
+adf.test(GS_res)
+adf.test(GS_res_sd)
+
+```
+
+# Risk Calculation
+
+```{r, warning=FALSE, message=FALSE}
+# Drawing a Random Sample
+rho <- coef(Ct)
+
+random_samples <- rCopula(10000,tCopula(rho[1], dim=2, df=rho[2]))
+
+# Transform Data
+
+random_samples <- random_samples %>%
+  data.frame()
+
+colnames(random_samples) <- c("SPXL.prob", "GS.prob")
+
+random_samples$SPXL.e.std <- qstd(random_samples$SPXL.prob, mean = std.SPXL_res[1], sd = std.SPXL_res[2], 
+                       nu = std.SPXL_res[3])
+random_samples$GS.e.std <- qstd(random_samples$GS.prob, mean = std.GS_res[1], sd = std.GS_res[2], 
+                     nu = std.GS_res[3])
+
+
+# Fit a AR(1)-GARCH(1,1) model to the returns
+
+ar1 <- function(mu, phi, x_prev) {
+  x = mu*(1-phi) + phi * x_prev
+  return(as.numeric(x))
+}
+
+garch1.1 <- function(omega, alpha, beta, e_prev, sigma_prev) {
+  sigma_sq <- omega + alpha*(e_prev^2) + beta*(sigma_prev^2)
+  sqrt(sigma_sq) %>% as.numeric() %>% return()
+}
+
+#SPXL
+
+spxl.params <- coef(SPXLfit)
+
+
+random_samples$spxl.next <- 
+  ar1(mu = spxl.params[1], phi = spxl.params[2], x_prev = spxl_log_ret$SPXL.Adjusted[nrow(spxl_log_ret)]) +
+  garch1.1(omega = spxl.params[3], alpha = spxl.params[4], beta = spxl.params[5],
+           e_prev = SPXL_res[nrow(spxl_log_ret)], sigma_prev = SPXL_res_sd[nrow(spxl_log_ret)]) * random_samples$SPXL.e.std
+
+#GS
+
+gs.params <- coef(GSfit)
+
+random_samples$gs.next <- 
+  ar1(mu = gs.params[1], phi = gs.params[2], x_prev = gs_log_ret$GS.Adjusted[nrow(gs_log_ret)]) +
+  garch1.1(omega = gs.params[3], alpha = gs.params[4], beta = gs.params[5],
+           e_prev = GS_res[nrow(gs_log_ret)], sigma_prev = GS_res_sd[nrow(gs_log_ret)]) * random_samples$GS.e.std
+
+#Apply AR(1,0)-GARCH(1,1)
+
+garch.SPXL = ugarchspec(mean.model=list(armaOrder=c(1,0)), 
+                        variance.model=list(garchOrder=c(1,1)), 
+                        distribution.model = "std")
+SPXL.garch.fit = ugarchfit(data=random_samples$SPXL.e.std, spec=garch.SPXL)
+
+garch.GS = ugarchspec(mean.model=list(armaOrder=c(1,0)), 
+                        variance.model=list(garchOrder=c(1,1)), 
+                        distribution.model = "std")
+GS.garch.fit = ugarchfit(data=random_samples$GS.e.std, spec=garch.GS)
+
+show(SPXL.garch.fit)
+summary(SPXL.garch.fit)
+plot(SPXL.garch.fit, which = 2, VaR.alpha=0.01)
+
+show(GS.garch.fit)
+summary(GS.garch.fit)
+plot(GS.garch.fit, which = 2, VaR.alpha=0.01)
+
+# Calculate one step forecasts
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+SPXL_cond_roll <- ugarchroll(garch.SPXL, random_samples$SPXL.e.std, n.start = 500, refit.every = 500, 
+                             refit.window = "moving", solver = "hybrid", 
+                             calculate.VaR = TRUE, VaR.alpha = 0.01, keep.coef = TRUE, 
+                             solver.control = list(tol = 1e-7, delta = 1e-9), 
+                             fit.control = list(scale = 1))
+plot(SPXL_cond_roll, which = 4)
+
+GS_cond_roll <- ugarchroll(garch.GS, random_samples$GS.e.std, n.start = 500, refit.every = 500, 
+                             refit.window = "moving", solver = "hybrid", 
+                             calculate.VaR = TRUE, VaR.alpha = 0.01, keep.coef = TRUE, 
+                             solver.control = list(tol = 1e-7, delta = 1e-9), 
+                             fit.control = list(scale = 1))
+plot(GS_cond_roll, which = 4)
+
+
+```
+
+# Calculate mu, sigma, VaR, ES
+```{r, warning=FALSE, message=FALSE}
+SPXL_cond_pred = ugarchforecast(SPXL.garch.fit, data=random_samples$SPXL.e.std, n.ahead=1)
+SPXL_mu.predict <- fitted(SPXL_cond_pred)
+SPXL_sig.predict <- sigma(SPXL_cond_pred)
+SPXL_VaR.predict <- as.numeric(SPXL_mu.predict + SPXL_sig.predict * qnorm(0.01))
+
+GS_cond_pred = ugarchforecast(GS.garch.fit, data=random_samples$GS.e.std, n.ahead=1)
+GS_mu.predict <- fitted(GS_cond_pred) 
+GS_sig.predict <- sigma(GS_cond_pred)
+GS_res = fitdistr(random_samples$GS.e.std,"t")
+GS_VaR.predict = GS_mu.predict + GS_sig.predict * qdist(distribution='std', shape=GS_res$estimate['df'], p=0.01)
+
+print(paste("VaR Conditional Prediction: ", round(SPXL_VaR.predict + GS_VaR.predict,3)))
+```
+
+#Rho Calculation
+
+
+```{r}
+mu.next <- dplyr::select(random_samples, spxl.next, gs.next) %>% as.matrix()
+rho <- matrix(rep(NA,18), ncol = 2)
+rho[,1] <- seq(.1,.9,.1)
+rho[,2] <- 1-rho[,1]
+
+portfolios <- mu.next %*% t(rho) 
+VaR <- qnorm(.1, mean = colMeans(portfolios), sd = apply(portfolios,2,sd)) * -1
+
+VaRs <- cbind(rho[,1], VaR)
+colnames(VaRs) <- c("rho","VaR")
+VaRs[,2] <- VaRs[,2] %>% round(5)
+VaRs %>% htmlTable
+```
+
